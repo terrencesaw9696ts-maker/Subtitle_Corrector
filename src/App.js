@@ -4,7 +4,7 @@ import SrtParser from "srt-parser-2";
 import "./styles.css";
 
 // --- 核心配置 ---
-const BATCH_SIZE = 25;
+const BATCH_SIZE = 25; 
 
 export default function App() {
   const [apiKey, setApiKey] = useState("");
@@ -14,9 +14,9 @@ export default function App() {
   const [progress, setProgress] = useState(0);
   const [isProcessing, setIsProcessing] = useState(false);
   const [finalSrt, setFinalSrt] = useState(null);
-
-  // ⚡️ 关键修改：默认锁定 gemini-1.5-flash (每天1500次额度)，而不是 latest (可能指向每天20次的2.5版)
-  const [selectedModel, setSelectedModel] = useState("gemini-1.5-flash");
+  
+  // ⚡️ 修复：使用带版本号的精确名称，避免 404
+  const [selectedModel, setSelectedModel] = useState("gemini-1.5-flash-002");
 
   const parser = new SrtParser();
 
@@ -36,7 +36,6 @@ export default function App() {
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
   const callGeminiWithRetry = async (fullPrompt, retries = 5) => {
-    // 强制使用 selectedModel，绝不使用 alias
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${selectedModel}:generateContent?key=${apiKey}`;
 
     const safetySettings = [
@@ -61,9 +60,8 @@ export default function App() {
           }),
         });
 
-        // 429 限流处理
         if (response.status === 429) {
-          const waitTime = 20000 + i * 10000;
+          const waitTime = 20000 + (i * 10000); 
           addLog(`⚠️ 触发限流 (429)，休息 ${waitTime / 1000} 秒...`);
           await sleep(waitTime);
           if (i === retries - 1) throw new Error("限流重试次数耗尽");
@@ -79,9 +77,7 @@ export default function App() {
         if (!response.ok) {
           const errorData = await response.json().catch(() => ({}));
           throw new Error(
-            `API 报错: ${response.status} - ${
-              errorData.error?.message || "未知错误"
-            }`
+            `API 报错: ${response.status} - ${errorData.error?.message || "未知错误"}`
           );
         }
 
@@ -118,16 +114,9 @@ export default function App() {
     if (!scriptText) return alert("请粘贴参考讲稿");
 
     setIsProcessing(true);
-    setLogs([]);
+    setLogs([]); 
     addLog(`🚀 启动修正 | 模型: ${selectedModel}`);
-
-    // 如果用户不小心选了 2.5，给个警告
-    if (selectedModel.includes("2.5")) {
-      addLog(
-        `⚠️ 警告: 你选择了 2.5 版本，该版本每天限制仅 20 次请求，极易失败！建议切换回 1.5。`
-      );
-    }
-
+    
     try {
       const fileText = await readFileAsText(srtFile);
       const srtArray = parser.fromSrt(fileText);
@@ -201,7 +190,7 @@ ${textBlock}
         setProgress(Math.round((batchIndex / totalBatches) * 100));
 
         if (batchIndex < totalBatches) {
-          await sleep(4000); // 1.5 flash 比较耐造，但还是稍微等等
+          await sleep(4000); 
         }
       }
 
@@ -237,8 +226,8 @@ ${textBlock}
 
   return (
     <div className="container">
-      <h1>🎬 字幕修正器 (Quota Fix)</h1>
-      <p className="subtitle">已锁定高配额模型 | 防止自动升级到预览版</p>
+      <h1>🎬 字幕修正器 (v3.0)</h1>
+      <p className="subtitle">精确模型版本 | 解决 404 错误</p>
 
       <div className="section">
         <label className="section-title">1. Google API 设置</label>
@@ -248,27 +237,17 @@ ${textBlock}
           value={apiKey}
           onChange={(e) => setApiKey(e.target.value)}
         />
-
-        <label className="section-title" style={{ marginTop: "15px" }}>
-          🤖 选择模型 (推荐 1.5 Flash)
-        </label>
-        <select
-          value={selectedModel}
+        
+        <label className="section-title" style={{marginTop: '15px'}}>🤖 选择模型 (已更新版本号)</label>
+        <select 
+          value={selectedModel} 
           onChange={(e) => setSelectedModel(e.target.value)}
-          style={{
-            width: "100%",
-            padding: "10px",
-            borderRadius: "6px",
-            border: "1px solid #ccc",
-          }}
+          style={{ width: '100%', padding: '10px', borderRadius: '6px', border: '1px solid #ccc' }}
         >
-          <option value="gemini-1.5-flash">
-            Gemini 1.5 Flash (稳定/额度高 - 推荐)
-          </option>
-          <option value="gemini-1.5-flash-8b">
-            Gemini 1.5 Flash-8b (极速)
-          </option>
-          {/* 这里故意不放 2.5，因为它额度太低了，除非你想测试 */}
+          {/* 使用精确的 -002 或 -001 后缀，而不是别名，这样 API 一定能找到 */}
+          <option value="gemini-1.5-flash-002">Gemini 1.5 Flash-002 (最新稳定版)</option>
+          <option value="gemini-1.5-flash-001">Gemini 1.5 Flash-001 (旧稳定版)</option>
+          <option value="gemini-1.5-flash-8b">Gemini 1.5 Flash-8b (极速版)</option>
         </select>
       </div>
 
