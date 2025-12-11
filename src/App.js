@@ -3,10 +3,10 @@ import React, { useState } from "react";
 import SrtParser from "srt-parser-2";
 import "./styles.css";
 
-// --- 核心配置调整 ---
-// 1. 降维打击：从 300 改回 75，确保单次请求不被 Google 判定为“体积过大”
+// --- 核心配置 ---
+// 1. 批处理大小：75 行
 const BATCH_SIZE = 75;
-// 2. 救星模型：你在截图中拥有的这个别名，通常指向配额最宽裕的 1.5 Flash 版本
+// 2. 模型锁定：gemini-flash-latest
 const MODEL_NAME = "gemini-flash-latest";
 
 export default function App() {
@@ -35,7 +35,7 @@ export default function App() {
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  // --- 核心请求函数 (带指数退避重试) ---
+  // --- 核心请求函数 ---
   const callGeminiWithRetry = async (fullPrompt, retries = 3) => {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${apiKey}`;
 
@@ -48,27 +48,24 @@ export default function App() {
             contents: [{ parts: [{ text: fullPrompt }] }],
             generationConfig: {
               temperature: 0.1,
-              // 不需要极端的 8192，常用的 4096 足够处理 75 行，且更安全
               maxOutputTokens: 4096,
             },
           }),
         });
 
-        // 429 错误处理
         if (response.status === 429) {
-          addLog(`⚠️ 触发频率限制 (429)，等待 20 秒...`); // 既然是小包，等待时间缩短
+          addLog(`⚠️ 触发限流 (429)，等待 20 秒...`);
           await sleep(20000);
           continue;
         }
 
         if (!response.ok) {
-          const errorData = await response.json().catch(() => ({}));
-          // 如果是 503 (服务暂时过载)，也值得重试
           if (response.status === 503) {
-            addLog(`⚠️ 服务器繁忙 (503)，等待 5 秒...`);
+            addLog(`⚠️ 服务器忙 (503)，等待 5 秒...`);
             await sleep(5000);
             continue;
           }
+          const errorData = await response.json().catch(() => ({}));
           throw new Error(
             `API 报错: ${response.status} - ${errorData.error?.message}`
           );
@@ -82,7 +79,7 @@ export default function App() {
         ) {
           return data.candidates[0].content.parts[0].text;
         } else {
-          throw new Error("数据结构异常");
+          throw new Error("API 返回数据异常");
         }
       } catch (error) {
         if (i === retries - 1) throw error;
@@ -99,8 +96,8 @@ export default function App() {
 
     setIsProcessing(true);
     setLogs([]);
-    addLog(`🚀 启动稳健模式 | 模型: ${MODEL_NAME}`);
-    addLog(`策略: 每批 ${BATCH_SIZE} 行 | 智能避开限额`);
+    addLog(`🚀 启动空格分词模式 | 模型: ${MODEL_NAME}`);
+    addLog(`规则: 逗号变空格 | 仅留问号 | 去口癖`);
 
     try {
       const fileText = await readFileAsText(srtFile);
@@ -121,23 +118,47 @@ export default function App() {
           .join("\n");
 
         addLog(
-          `正在处理第 ${batchIndex} / ${totalBatches} 批 (共 ${currentBatch.length} 行)...`
+          `正在处理第 ${batchIndex} / ${totalBatches} 批...`
         );
 
-        const fullPrompt = `你是一个校对助手。
-任务：根据以下【参考讲稿】修正【待修正字幕】中的错别字。
+        // --- 🚀 PROMPT 更新：逗号变空格逻辑 ---
+        const fullPrompt = `你是一个专业的字幕校对专家。
+任务：利用【参考讲稿】来检测并修复【待修正字幕】。
 
-【严格规则】：
-1. 强制使用简体中文。
-2. 绝对不要修改行数，输入 ${currentBatch.length} 行，必须输出 ${
-          currentBatch.length
-        } 行。
-3. 保持格式：序号>>>修正后的文本。
-4. 不要改变原意，只改错字。
-5. 不要输出任何开场白或结束语。
+【核心处理法则 (严格执行)】：
+1. **标点符号特殊处理（空格模式）**：
+   - **逗号（，）**：**必须替换为空格**。严禁直接删除导致文字粘连，必须用空格隔开（例如："你好，我来了" -> "你好 我来了"）。
+   - **句号（。）/感叹号（！）**：如果在句中，替换为空格；如果在句尾，可以直接删除。
+   - **问号（？）**：如果讲稿中是问句，**必须保留**问号。
+2. **去除语助词**：强制删除“呢、哈、啊、嘛、那个”等无意义口语词。
+3. **保留原话**：在满足上述规则的前提下，尽量保留字幕原本的口语表达。
+4. **修正错别字**：仅修正同音错字（如“起托”->“解脱”）。
+
+【判定示例 (Few-Shot)】：
+- 情况A (逗号变空格)：
+  讲稿: "你好，我来了。"
+  字幕: "你好，我来了"
+  -> 修正: 你好 我来了 (逗号变成了空格)
+- 情况B (去口癖 + 逗号变空格)：
+  讲稿: "大家都知道，这件事很难。"
+  字幕: "大家呢，都知道哈，这件事啊，很难。"
+  -> 修正: 大家都知道 这件事很难 (去除了呢/哈/啊，逗号变成了空格)
+- 情况C (保留问号)：
+  讲稿: "你吃饭了吗？"
+  字幕: "你吃饭了吗"
+  -> 修正: 你吃饭了吗？
+- 情况D (保留原话 & 标点处理)：
+  讲稿: "如果从佛法角度看，这是对的。"
+  字幕: "如果站在佛法来看，这是对的。"
+  -> 修正: 如果站在佛法来看 这是对的
+
+【输出要求】：
+1. 必须输出 ${currentBatch.length} 行。
+2. 格式：序号>>>修正后的文本。
+3. 严禁输出解释。
 
 【参考讲稿片段】：
-${scriptText.slice(0, 4000)}... 
+${scriptText.slice(0, 4000)}...
 
 【待修正字幕】：
 ${textBlock}
@@ -167,7 +188,6 @@ ${textBlock}
         processedArray = [...processedArray, ...safeBatch];
         setProgress(Math.round((batchIndex / totalBatches) * 100));
 
-        // 冷却策略：75行处理很快，我们稍微休息 3 秒即可
         if (batchIndex < totalBatches) {
           await sleep(3000);
         }
@@ -175,7 +195,7 @@ ${textBlock}
 
       const finalString = parser.toSrt(processedArray);
       setFinalSrt(finalString);
-      addLog("🎉 修正完成！");
+      addLog("🎉 清洗完成！(逗号已变空格)");
       setIsProcessing(false);
     } catch (error) {
       console.error(error);
@@ -205,8 +225,8 @@ ${textBlock}
 
   return (
     <div className="container">
-      <h1>🎬 字幕修正器 (稳健版)</h1>
-      <p className="subtitle">Model: {MODEL_NAME} | 75行/批 | 避开限额</p>
+      <h1>🎬 字幕修正器 (空格分词版)</h1>
+      <p className="subtitle">Model: {MODEL_NAME} | 逗号变空格 | 仅留问号</p>
 
       <div className="section">
         <label className="section-title">1. Google API 设置</label>
@@ -219,7 +239,7 @@ ${textBlock}
       </div>
 
       <div className="section">
-        <label className="section-title">2. 参考讲稿 (用于校对上下文)</label>
+        <label className="section-title">2. 参考讲稿 (用于上下文校对)</label>
         <textarea
           placeholder="在此粘贴正确的讲稿内容..."
           value={scriptText}
