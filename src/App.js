@@ -3,11 +3,11 @@ import React, { useState } from "react";
 import SrtParser from "srt-parser-2";
 import "./styles.css";
 
-// --- 核心配置 ---
-// 1. 批处理大小：75 行
-const BATCH_SIZE = 75;
-// 2. 模型锁定：gemini-flash-latest
-const MODEL_NAME = "gemini-flash-latest";
+// --- 核心配置 (已优化) ---
+// 1. 批处理大小：降至 25 行 (避免 MAX_TOKENS 截断和 429 限流)
+const BATCH_SIZE = 25;
+// 2. 模型：使用稳定版 gemini-1.5-flash
+const MODEL_NAME = "gemini-1.5-flash";
 
 export default function App() {
   const [apiKey, setApiKey] = useState("");
@@ -21,7 +21,7 @@ export default function App() {
   const parser = new SrtParser();
 
   const addLog = (msg) => {
-    setLogs((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
+    setLogs((prev) => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev]);
   };
 
   const handleFileChange = (e) => {
@@ -35,11 +35,10 @@ export default function App() {
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  // --- 核心请求函数 (含安全设置与严格重试逻辑) ---
-  const callGeminiWithRetry = async (fullPrompt, retries = 3) => {
+  // --- 核心请求函数 (增强重试与空值保护) ---
+  const callGeminiWithRetry = async (fullPrompt, retries = 4) => {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${apiKey}`;
 
-    // 强制关闭安全拦截
     const safetySettings = [
       { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
       { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
@@ -57,38 +56,39 @@ export default function App() {
             safetySettings: safetySettings,
             generationConfig: {
               temperature: 0.1,
-              maxOutputTokens: 4096,
+              maxOutputTokens: 8192, // 尝试请求更大 token (取决于模型支持)
             },
           }),
         });
 
-        // 处理 429 限流
+        // 处理 429 限流 (指数退避)
         if (response.status === 429) {
-          addLog(`⚠️ 触发限流 (429)，等待 20 秒...`);
-          await sleep(20000);
+          const waitTime = 20000 + i * 5000; // 20s, 25s, 30s...
+          addLog(`⚠️ 触发限流 (429)，等待 ${waitTime / 1000} 秒...`);
+          await sleep(waitTime);
           if (i === retries - 1) throw new Error("限流重试次数耗尽");
           continue;
         }
 
-        if (!response.ok) {
-          // 处理 503 服务器忙
-          if (response.status === 503) {
-            addLog(`⚠️ 服务器忙 (503)，等待 5 秒...`);
-            await sleep(5000);
-            if (i === retries - 1)
-              throw new Error("服务器繁忙 (503) - 重试次数耗尽");
-            continue;
-          }
+        // 处理 503
+        if (response.status === 503) {
+          addLog(`⚠️ 服务器忙 (503)，等待 5 秒...`);
+          await sleep(5000);
+          continue;
+        }
 
+        if (!response.ok) {
           const errorData = await response.json().catch(() => ({}));
           throw new Error(
-            `API 报错: ${response.status} - ${errorData.error?.message}`
+            `API 报错: ${response.status} - ${
+              errorData.error?.message || "未知错误"
+            }`
           );
         }
 
         const data = await response.json();
 
-        // --- 增强的错误诊断 ---
+        // 成功提取数据
         if (
           data.candidates &&
           data.candidates.length > 0 &&
@@ -97,26 +97,22 @@ export default function App() {
         ) {
           return data.candidates[0].content.parts[0].text;
         } else {
-          // 如果没有内容，检查 finishReason
+          // 失败原因分析
           let reason = "未知原因";
           if (data.candidates && data.candidates.length > 0) {
             reason = data.candidates[0].finishReason || "未知";
           } else if (data.promptFeedback) {
             reason = `Prompt被拦截 (${data.promptFeedback.blockReason})`;
           }
-
-          console.error("API 数据异常详情:", JSON.stringify(data, null, 2));
-          throw new Error(`API 拒绝生成 (原因: ${reason}) - 请检查控制台`);
+          throw new Error(`API 拒绝生成 (原因: ${reason})`);
         }
       } catch (error) {
-        if (i === retries - 1) throw error; // 最后一次失败，直接抛出，不再重试
+        if (i === retries - 1) throw error; // 最后一次失败，抛出
         addLog(`❌ 请求出错 (${error.message})，重试中...`);
         await sleep(5000);
       }
     }
-
-    // 如果循环意外结束没有返回
-    throw new Error("未知网络错误：请求未返回数据");
+    throw new Error("请求逻辑异常终止");
   };
 
   const processSrt = async () => {
@@ -125,10 +121,8 @@ export default function App() {
     if (!scriptText) return alert("请粘贴参考讲稿");
 
     setIsProcessing(true);
-    setLogs([]);
-    addLog(`🚀 启动空格分词模式 | 模型: ${MODEL_NAME}`);
-    addLog(`规则: 逗号变空格 | 仅留问号 | 去口癖 | 强制简中`);
-    addLog(`🛡️ 安全策略: 已设置为 BLOCK_NONE`);
+    setLogs([]); // 清空日志
+    addLog(`🚀 启动修正 | 批次大小: ${BATCH_SIZE} | 模型: ${MODEL_NAME}`);
 
     try {
       const fileText = await readFileAsText(srtFile);
@@ -150,45 +144,27 @@ export default function App() {
 
         addLog(`正在处理第 ${batchIndex} / ${totalBatches} 批...`);
 
-        // --- 🚀 PROMPT (包含强制简中) ---
+        // --- PROMPT ---
         const fullPrompt = `你是一个专业的字幕校对专家。
 任务：利用【参考讲稿】来检测并修复【待修正字幕】。
 
 【核心处理法则 (严格执行)】：
 1. **标点符号特殊处理（空格模式）**：
-   - **逗号（，）**：**必须替换为空格**。严禁直接删除导致文字粘连，必须用空格隔开（例如："你好，我来了" -> "你好 我来了"）。
+   - **逗号（，）**：**必须替换为空格**。严禁直接删除导致文字粘连，必须用空格隔开。
    - **句号（。）/感叹号（！）**：如果在句中，替换为空格；如果在句尾，可以直接删除。
    - **问号（？）**：如果讲稿中是问句，**必须保留**问号。
 2. **去除语助词**：强制删除“呢、哈、啊、嘛、那个”等无意义口语词。
 3. **保留原话**：在满足上述规则的前提下，尽量保留字幕原本的口语表达。
-4. **修正错别字**：仅修正同音错字（如“起托”->“解脱”）。
-5. **强制简体中文**：无论输入字幕或讲稿是繁体或英文，输出结果必须严格转换为**简体中文**。
-
-【判定示例 (Few-Shot)】：
-- 情况A (逗号变空格)：
-  讲稿: "你好，我来了。"
-  字幕: "你好，我来了"
-  -> 修正: 你好 我来了 (逗号变成了空格)
-- 情况B (去口癖 + 逗号变空格)：
-  讲稿: "大家都知道，这件事很难。"
-  字幕: "大家呢，都知道哈，这件事啊，很难。"
-  -> 修正: 大家都知道 这件事很难 (去除了呢/哈/啊，逗号变成了空格)
-- 情况C (保留问号)：
-  讲稿: "你吃饭了吗？"
-  字幕: "你吃饭了吗"
-  -> 修正: 你吃饭了吗？
-- 情况D (强制简中)：
-  讲稿: "這是正確的。"
-  字幕: "這是正確的"
-  -> 修正: 这是正确的
+4. **修正错别字**：仅修正同音错字。
+5. **强制简体中文**：输出结果必须严格转换为**简体中文**。
 
 【输出要求】：
-1. 必须输出 ${currentBatch.length} 行。
+1. 必须输出 ${currentBatch.length} 行，不要遗漏。
 2. 格式：序号>>>修正后的文本。
 3. 严禁输出解释。
 
 【参考讲稿片段】：
-${scriptText.slice(0, 4000)}...
+${scriptText.slice(0, 3000)}...
 
 【待修正字幕】：
 ${textBlock}
@@ -196,9 +172,9 @@ ${textBlock}
 
         const resultText = await callGeminiWithRetry(fullPrompt);
 
-        // 防御性编程：再次检查 resultText 是否存在
-        if (!resultText) {
-          throw new Error("API 返回了空内容");
+        // --- 防御性检查 (解决 split 报错) ---
+        if (!resultText || typeof resultText !== "string") {
+          throw new Error("API 返回数据格式无效 (非字符串)");
         }
 
         const fixedLinesMap = {};
@@ -214,6 +190,7 @@ ${textBlock}
         // 缝合逻辑
         const safeBatch = currentBatch.map((item, idx) => {
           const key = (idx + 1).toString();
+          // 如果 API 漏掉了某一行，保持原样，不要报错
           return {
             ...item,
             text: fixedLinesMap[key] || item.text,
@@ -223,18 +200,19 @@ ${textBlock}
         processedArray = [...processedArray, ...safeBatch];
         setProgress(Math.round((batchIndex / totalBatches) * 100));
 
+        // 批次间休息 5 秒 (避免 429)
         if (batchIndex < totalBatches) {
-          await sleep(3000);
+          await sleep(5000);
         }
       }
 
       const finalString = parser.toSrt(processedArray);
       setFinalSrt(finalString);
-      addLog("🎉 清洗完成！(逗号已变空格)");
+      addLog("🎉 全部完成！");
       setIsProcessing(false);
     } catch (error) {
       console.error(error);
-      addLog(`❌ 失败: ${error.message}`);
+      addLog(`❌ 严重错误: ${error.message}`);
       setIsProcessing(false);
       alert("处理中断: " + error.message);
     }
@@ -260,8 +238,10 @@ ${textBlock}
 
   return (
     <div className="container">
-      <h1>🎬 字幕修正器 (空格分词版)</h1>
-      <p className="subtitle">Model: {MODEL_NAME} | 逗号变空格 | 仅留问号</p>
+      <h1>🎬 字幕修正器 (稳定版)</h1>
+      <p className="subtitle">
+        Model: {MODEL_NAME} | 批次: {BATCH_SIZE}行/次
+      </p>
 
       <div className="section">
         <label className="section-title">1. Google API 设置</label>
