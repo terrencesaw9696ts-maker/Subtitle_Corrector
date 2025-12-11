@@ -35,11 +35,11 @@ export default function App() {
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  // --- 核心请求函数 (含安全设置与重试) ---
+  // --- 核心请求函数 (含安全设置与严格重试逻辑) ---
   const callGeminiWithRetry = async (fullPrompt, retries = 3) => {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${apiKey}`;
 
-    // 强制关闭安全拦截 (这是解决 "API 返回数据异常" 的关键)
+    // 强制关闭安全拦截
     const safetySettings = [
       { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
       { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
@@ -54,7 +54,7 @@ export default function App() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             contents: [{ parts: [{ text: fullPrompt }] }],
-            safetySettings: safetySettings, // 注入安全设置
+            safetySettings: safetySettings,
             generationConfig: {
               temperature: 0.1,
               maxOutputTokens: 4096,
@@ -62,18 +62,24 @@ export default function App() {
           }),
         });
 
+        // 处理 429 限流
         if (response.status === 429) {
           addLog(`⚠️ 触发限流 (429)，等待 20 秒...`);
           await sleep(20000);
+          if (i === retries - 1) throw new Error("限流重试次数耗尽");
           continue;
         }
 
         if (!response.ok) {
+          // 处理 503 服务器忙
           if (response.status === 503) {
             addLog(`⚠️ 服务器忙 (503)，等待 5 秒...`);
             await sleep(5000);
+            if (i === retries - 1)
+              throw new Error("服务器繁忙 (503) - 重试次数耗尽");
             continue;
           }
+
           const errorData = await response.json().catch(() => ({}));
           throw new Error(
             `API 报错: ${response.status} - ${errorData.error?.message}`
@@ -81,7 +87,7 @@ export default function App() {
         }
 
         const data = await response.json();
-        
+
         // --- 增强的错误诊断 ---
         if (
           data.candidates &&
@@ -98,16 +104,19 @@ export default function App() {
           } else if (data.promptFeedback) {
             reason = `Prompt被拦截 (${data.promptFeedback.blockReason})`;
           }
-          
+
           console.error("API 数据异常详情:", JSON.stringify(data, null, 2));
           throw new Error(`API 拒绝生成 (原因: ${reason}) - 请检查控制台`);
         }
       } catch (error) {
-        if (i === retries - 1) throw error;
+        if (i === retries - 1) throw error; // 最后一次失败，直接抛出，不再重试
         addLog(`❌ 请求出错 (${error.message})，重试中...`);
         await sleep(5000);
       }
     }
+
+    // 如果循环意外结束没有返回
+    throw new Error("未知网络错误：请求未返回数据");
   };
 
   const processSrt = async () => {
@@ -119,7 +128,7 @@ export default function App() {
     setLogs([]);
     addLog(`🚀 启动空格分词模式 | 模型: ${MODEL_NAME}`);
     addLog(`规则: 逗号变空格 | 仅留问号 | 去口癖 | 强制简中`);
-    addLog(`🛡️ 安全策略: 已设置为 BLOCK_NONE (防止误杀)`);
+    addLog(`🛡️ 安全策略: 已设置为 BLOCK_NONE`);
 
     try {
       const fileText = await readFileAsText(srtFile);
@@ -139,11 +148,9 @@ export default function App() {
           .map((item, idx) => `${idx + 1}>>>${item.text}`)
           .join("\n");
 
-        addLog(
-          `正在处理第 ${batchIndex} / ${totalBatches} 批...`
-        );
+        addLog(`正在处理第 ${batchIndex} / ${totalBatches} 批...`);
 
-        // --- 🚀 PROMPT 更新：增加强制简中逻辑 ---
+        // --- 🚀 PROMPT (包含强制简中) ---
         const fullPrompt = `你是一个专业的字幕校对专家。
 任务：利用【参考讲稿】来检测并修复【待修正字幕】。
 
@@ -188,6 +195,11 @@ ${textBlock}
 `;
 
         const resultText = await callGeminiWithRetry(fullPrompt);
+
+        // 防御性编程：再次检查 resultText 是否存在
+        if (!resultText) {
+          throw new Error("API 返回了空内容");
+        }
 
         const fixedLinesMap = {};
         resultText.split("\n").forEach((line) => {
