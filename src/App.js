@@ -35,9 +35,17 @@ export default function App() {
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  // --- 核心请求函数 ---
+  // --- 核心请求函数 (含安全设置与重试) ---
   const callGeminiWithRetry = async (fullPrompt, retries = 3) => {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${apiKey}`;
+
+    // 强制关闭安全拦截 (这是解决 "API 返回数据异常" 的关键)
+    const safetySettings = [
+      { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
+    ];
 
     for (let i = 0; i < retries; i++) {
       try {
@@ -46,6 +54,7 @@ export default function App() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             contents: [{ parts: [{ text: fullPrompt }] }],
+            safetySettings: safetySettings, // 注入安全设置
             generationConfig: {
               temperature: 0.1,
               maxOutputTokens: 4096,
@@ -72,14 +81,26 @@ export default function App() {
         }
 
         const data = await response.json();
+        
+        // --- 增强的错误诊断 ---
         if (
           data.candidates &&
+          data.candidates.length > 0 &&
           data.candidates[0].content &&
           data.candidates[0].content.parts
         ) {
           return data.candidates[0].content.parts[0].text;
         } else {
-          throw new Error("API 返回数据异常");
+          // 如果没有内容，检查 finishReason
+          let reason = "未知原因";
+          if (data.candidates && data.candidates.length > 0) {
+            reason = data.candidates[0].finishReason || "未知";
+          } else if (data.promptFeedback) {
+            reason = `Prompt被拦截 (${data.promptFeedback.blockReason})`;
+          }
+          
+          console.error("API 数据异常详情:", JSON.stringify(data, null, 2));
+          throw new Error(`API 拒绝生成 (原因: ${reason}) - 请检查控制台`);
         }
       } catch (error) {
         if (i === retries - 1) throw error;
@@ -98,6 +119,7 @@ export default function App() {
     setLogs([]);
     addLog(`🚀 启动空格分词模式 | 模型: ${MODEL_NAME}`);
     addLog(`规则: 逗号变空格 | 仅留问号 | 去口癖 | 强制简中`);
+    addLog(`🛡️ 安全策略: 已设置为 BLOCK_NONE (防止误杀)`);
 
     try {
       const fileText = await readFileAsText(srtFile);
@@ -117,7 +139,9 @@ export default function App() {
           .map((item, idx) => `${idx + 1}>>>${item.text}`)
           .join("\n");
 
-        addLog(`正在处理第 ${batchIndex} / ${totalBatches} 批...`);
+        addLog(
+          `正在处理第 ${batchIndex} / ${totalBatches} 批...`
+        );
 
         // --- 🚀 PROMPT 更新：增加强制简中逻辑 ---
         const fullPrompt = `你是一个专业的字幕校对专家。
