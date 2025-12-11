@@ -4,7 +4,8 @@ import SrtParser from "srt-parser-2";
 import "./styles.css";
 
 // --- 核心配置 ---
-const BATCH_SIZE = 25; 
+// Gemma 处理速度可能不同，保持 25 行比较稳妥
+const BATCH_SIZE = 25;
 
 export default function App() {
   const [apiKey, setApiKey] = useState("");
@@ -14,9 +15,10 @@ export default function App() {
   const [progress, setProgress] = useState(0);
   const [isProcessing, setIsProcessing] = useState(false);
   const [finalSrt, setFinalSrt] = useState(null);
-  
-  // ⚡️ 修复：使用带版本号的精确名称，避免 404
-  const [selectedModel, setSelectedModel] = useState("gemini-1.5-flash-002");
+
+  // ⚡️ 更新：默认尝试使用 Gemma 3 (27b-it)
+  // 如果报错 404，请尝试切换下拉菜单里的其他 Gemma 版本
+  const [selectedModel, setSelectedModel] = useState("gemma-3-27b-it");
 
   const parser = new SrtParser();
 
@@ -36,6 +38,7 @@ export default function App() {
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
   const callGeminiWithRetry = async (fullPrompt, retries = 5) => {
+    // 动态构建 URL
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${selectedModel}:generateContent?key=${apiKey}`;
 
     const safetySettings = [
@@ -55,19 +58,22 @@ export default function App() {
             safetySettings: safetySettings,
             generationConfig: {
               temperature: 0.1,
+              // Gemma 的 maxOutputTokens 可能会小一些，8192 是安全值
               maxOutputTokens: 8192,
             },
           }),
         });
 
+        // 429 限流处理
         if (response.status === 429) {
-          const waitTime = 20000 + (i * 10000); 
+          const waitTime = 20000 + i * 10000;
           addLog(`⚠️ 触发限流 (429)，休息 ${waitTime / 1000} 秒...`);
           await sleep(waitTime);
           if (i === retries - 1) throw new Error("限流重试次数耗尽");
           continue;
         }
 
+        // 503 服务器忙
         if (response.status === 503) {
           addLog(`⚠️ 服务器繁忙 (503)，等待 10 秒...`);
           await sleep(10000);
@@ -77,7 +83,9 @@ export default function App() {
         if (!response.ok) {
           const errorData = await response.json().catch(() => ({}));
           throw new Error(
-            `API 报错: ${response.status} - ${errorData.error?.message || "未知错误"}`
+            `API 报错: ${response.status} - ${
+              errorData.error?.message || "未知错误"
+            }`
           );
         }
 
@@ -101,7 +109,15 @@ export default function App() {
         }
       } catch (error) {
         if (i === retries - 1) throw error;
-        addLog(`❌ 请求出错 (${error.message})，重试中...`);
+        // 捕获特定错误信息以提供建议
+        const errMsg = error.message;
+        if (errMsg.includes("404")) {
+          addLog(
+            `❌ 找不到模型 (${selectedModel})。可能是 API 名称不匹配，请尝试下拉菜单中的其他选项。`
+          );
+          throw error; // 404 不重试，直接抛出让用户换模型
+        }
+        addLog(`❌ 请求出错 (${errMsg})，重试中...`);
         await sleep(5000);
       }
     }
@@ -114,9 +130,10 @@ export default function App() {
     if (!scriptText) return alert("请粘贴参考讲稿");
 
     setIsProcessing(true);
-    setLogs([]); 
+    setLogs([]);
     addLog(`🚀 启动修正 | 模型: ${selectedModel}`);
-    
+    addLog(`ℹ️ 注意: Gemma 模型对指令的遵循度可能与 Gemini 不同，正在测试...`);
+
     try {
       const fileText = await readFileAsText(srtFile);
       const srtArray = parser.fromSrt(fileText);
@@ -190,7 +207,7 @@ ${textBlock}
         setProgress(Math.round((batchIndex / totalBatches) * 100));
 
         if (batchIndex < totalBatches) {
-          await sleep(4000); 
+          await sleep(4000);
         }
       }
 
@@ -226,8 +243,8 @@ ${textBlock}
 
   return (
     <div className="container">
-      <h1>🎬 字幕修正器 (v3.0)</h1>
-      <p className="subtitle">精确模型版本 | 解决 404 错误</p>
+      <h1>🎬 字幕修正器 (Gemma 3 Edition)</h1>
+      <p className="subtitle">正在使用 Google 最新开源模型 Gemma 3</p>
 
       <div className="section">
         <label className="section-title">1. Google API 设置</label>
@@ -237,18 +254,35 @@ ${textBlock}
           value={apiKey}
           onChange={(e) => setApiKey(e.target.value)}
         />
-        
-        <label className="section-title" style={{marginTop: '15px'}}>🤖 选择模型 (已更新版本号)</label>
-        <select 
-          value={selectedModel} 
+
+        <label className="section-title" style={{ marginTop: "15px" }}>
+          🤖 选择模型 (Gemma 3 测试)
+        </label>
+        <select
+          value={selectedModel}
           onChange={(e) => setSelectedModel(e.target.value)}
-          style={{ width: '100%', padding: '10px', borderRadius: '6px', border: '1px solid #ccc' }}
+          style={{
+            width: "100%",
+            padding: "10px",
+            borderRadius: "6px",
+            border: "1px solid #ccc",
+          }}
         >
-          {/* 使用精确的 -002 或 -001 后缀，而不是别名，这样 API 一定能找到 */}
-          <option value="gemini-1.5-flash-002">Gemini 1.5 Flash-002 (最新稳定版)</option>
-          <option value="gemini-1.5-flash-001">Gemini 1.5 Flash-001 (旧稳定版)</option>
-          <option value="gemini-1.5-flash-8b">Gemini 1.5 Flash-8b (极速版)</option>
+          {/* Gemma 3 系列 (基于您的截图) */}
+          <option value="gemma-3-27b-it">Gemma 3 27B (推荐: 逻辑最强)</option>
+          <option value="gemma-3-12b-it">Gemma 3 12B (平衡)</option>
+          <option value="gemma-3-4b-it">Gemma 3 4B (快速/轻量)</option>
+          <option value="gemma-3-1b-it">Gemma 3 1B (极速/仅测试)</option>
+
+          <option disabled>--- 备用方案 ---</option>
+          <option value="gemini-1.5-flash-002">
+            Gemini 1.5 Flash (稳定版)
+          </option>
         </select>
+        <small style={{ display: "block", marginTop: "5px", color: "#666" }}>
+          * 注意：Gemma 是开源模型，如果 API 报错 404，说明该 Key
+          或地区暂不支持通过 HTTP API 直接调用 Gemma 3。
+        </small>
       </div>
 
       <div className="section">
