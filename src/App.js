@@ -3,11 +3,8 @@ import React, { useState } from "react";
 import SrtParser from "srt-parser-2";
 import "./styles.css";
 
-// --- 核心配置 (已优化) ---
-// 1. 批处理大小：降至 25 行 (避免 MAX_TOKENS 截断和 429 限流)
+// --- 核心配置 ---
 const BATCH_SIZE = 25;
-// 2. 模型：使用稳定版 gemini-1.5-flash
-const MODEL_NAME = "gemini-1.5-flash";
 
 export default function App() {
   const [apiKey, setApiKey] = useState("");
@@ -17,6 +14,9 @@ export default function App() {
   const [progress, setProgress] = useState(0);
   const [isProcessing, setIsProcessing] = useState(false);
   const [finalSrt, setFinalSrt] = useState(null);
+
+  // ⚡️ 关键修改：默认锁定 gemini-1.5-flash (每天1500次额度)，而不是 latest (可能指向每天20次的2.5版)
+  const [selectedModel, setSelectedModel] = useState("gemini-1.5-flash");
 
   const parser = new SrtParser();
 
@@ -35,9 +35,9 @@ export default function App() {
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  // --- 核心请求函数 (增强重试与空值保护) ---
-  const callGeminiWithRetry = async (fullPrompt, retries = 4) => {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${apiKey}`;
+  const callGeminiWithRetry = async (fullPrompt, retries = 5) => {
+    // 强制使用 selectedModel，绝不使用 alias
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${selectedModel}:generateContent?key=${apiKey}`;
 
     const safetySettings = [
       { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
@@ -56,24 +56,23 @@ export default function App() {
             safetySettings: safetySettings,
             generationConfig: {
               temperature: 0.1,
-              maxOutputTokens: 8192, // 尝试请求更大 token (取决于模型支持)
+              maxOutputTokens: 8192,
             },
           }),
         });
 
-        // 处理 429 限流 (指数退避)
+        // 429 限流处理
         if (response.status === 429) {
-          const waitTime = 20000 + i * 5000; // 20s, 25s, 30s...
-          addLog(`⚠️ 触发限流 (429)，等待 ${waitTime / 1000} 秒...`);
+          const waitTime = 20000 + i * 10000;
+          addLog(`⚠️ 触发限流 (429)，休息 ${waitTime / 1000} 秒...`);
           await sleep(waitTime);
           if (i === retries - 1) throw new Error("限流重试次数耗尽");
           continue;
         }
 
-        // 处理 503
         if (response.status === 503) {
-          addLog(`⚠️ 服务器忙 (503)，等待 5 秒...`);
-          await sleep(5000);
+          addLog(`⚠️ 服务器繁忙 (503)，等待 10 秒...`);
+          await sleep(10000);
           continue;
         }
 
@@ -88,7 +87,6 @@ export default function App() {
 
         const data = await response.json();
 
-        // 成功提取数据
         if (
           data.candidates &&
           data.candidates.length > 0 &&
@@ -97,7 +95,6 @@ export default function App() {
         ) {
           return data.candidates[0].content.parts[0].text;
         } else {
-          // 失败原因分析
           let reason = "未知原因";
           if (data.candidates && data.candidates.length > 0) {
             reason = data.candidates[0].finishReason || "未知";
@@ -107,7 +104,7 @@ export default function App() {
           throw new Error(`API 拒绝生成 (原因: ${reason})`);
         }
       } catch (error) {
-        if (i === retries - 1) throw error; // 最后一次失败，抛出
+        if (i === retries - 1) throw error;
         addLog(`❌ 请求出错 (${error.message})，重试中...`);
         await sleep(5000);
       }
@@ -121,8 +118,15 @@ export default function App() {
     if (!scriptText) return alert("请粘贴参考讲稿");
 
     setIsProcessing(true);
-    setLogs([]); // 清空日志
-    addLog(`🚀 启动修正 | 批次大小: ${BATCH_SIZE} | 模型: ${MODEL_NAME}`);
+    setLogs([]);
+    addLog(`🚀 启动修正 | 模型: ${selectedModel}`);
+
+    // 如果用户不小心选了 2.5，给个警告
+    if (selectedModel.includes("2.5")) {
+      addLog(
+        `⚠️ 警告: 你选择了 2.5 版本，该版本每天限制仅 20 次请求，极易失败！建议切换回 1.5。`
+      );
+    }
 
     try {
       const fileText = await readFileAsText(srtFile);
@@ -144,7 +148,6 @@ export default function App() {
 
         addLog(`正在处理第 ${batchIndex} / ${totalBatches} 批...`);
 
-        // --- PROMPT ---
         const fullPrompt = `你是一个专业的字幕校对专家。
 任务：利用【参考讲稿】来检测并修复【待修正字幕】。
 
@@ -172,9 +175,8 @@ ${textBlock}
 
         const resultText = await callGeminiWithRetry(fullPrompt);
 
-        // --- 防御性检查 (解决 split 报错) ---
         if (!resultText || typeof resultText !== "string") {
-          throw new Error("API 返回数据格式无效 (非字符串)");
+          throw new Error("API 返回数据格式无效");
         }
 
         const fixedLinesMap = {};
@@ -187,10 +189,8 @@ ${textBlock}
           }
         });
 
-        // 缝合逻辑
         const safeBatch = currentBatch.map((item, idx) => {
           const key = (idx + 1).toString();
-          // 如果 API 漏掉了某一行，保持原样，不要报错
           return {
             ...item,
             text: fixedLinesMap[key] || item.text,
@@ -200,9 +200,8 @@ ${textBlock}
         processedArray = [...processedArray, ...safeBatch];
         setProgress(Math.round((batchIndex / totalBatches) * 100));
 
-        // 批次间休息 5 秒 (避免 429)
         if (batchIndex < totalBatches) {
-          await sleep(5000);
+          await sleep(4000); // 1.5 flash 比较耐造，但还是稍微等等
         }
       }
 
@@ -238,10 +237,8 @@ ${textBlock}
 
   return (
     <div className="container">
-      <h1>🎬 字幕修正器 (稳定版)</h1>
-      <p className="subtitle">
-        Model: {MODEL_NAME} | 批次: {BATCH_SIZE}行/次
-      </p>
+      <h1>🎬 字幕修正器 (Quota Fix)</h1>
+      <p className="subtitle">已锁定高配额模型 | 防止自动升级到预览版</p>
 
       <div className="section">
         <label className="section-title">1. Google API 设置</label>
@@ -251,10 +248,32 @@ ${textBlock}
           value={apiKey}
           onChange={(e) => setApiKey(e.target.value)}
         />
+
+        <label className="section-title" style={{ marginTop: "15px" }}>
+          🤖 选择模型 (推荐 1.5 Flash)
+        </label>
+        <select
+          value={selectedModel}
+          onChange={(e) => setSelectedModel(e.target.value)}
+          style={{
+            width: "100%",
+            padding: "10px",
+            borderRadius: "6px",
+            border: "1px solid #ccc",
+          }}
+        >
+          <option value="gemini-1.5-flash">
+            Gemini 1.5 Flash (稳定/额度高 - 推荐)
+          </option>
+          <option value="gemini-1.5-flash-8b">
+            Gemini 1.5 Flash-8b (极速)
+          </option>
+          {/* 这里故意不放 2.5，因为它额度太低了，除非你想测试 */}
+        </select>
       </div>
 
       <div className="section">
-        <label className="section-title">2. 参考讲稿 (用于上下文校对)</label>
+        <label className="section-title">2. 参考讲稿</label>
         <textarea
           placeholder="在此粘贴正确的讲稿内容..."
           value={scriptText}
