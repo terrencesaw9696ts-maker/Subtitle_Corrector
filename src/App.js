@@ -97,7 +97,7 @@ export default function App() {
     setIsProcessing(true);
     setLogs([]);
     addLog(`🚀 启动空格分词模式 | 模型: ${MODEL_NAME}`);
-    addLog(`规则: 逗号变空格 | 仅留问号 | 去口癖`);
+    addLog(`规则: 逗号变空格 | 仅留问号 | 去口癖 | 强制简中`);
 
     try {
       const fileText = await readFileAsText(srtFile);
@@ -117,11 +117,9 @@ export default function App() {
           .map((item, idx) => `${idx + 1}>>>${item.text}`)
           .join("\n");
 
-        addLog(
-          `正在处理第 ${batchIndex} / ${totalBatches} 批...`
-        );
+        addLog(`正在处理第 ${batchIndex} / ${totalBatches} 批...`);
 
-        // --- 🚀 PROMPT 更新：逗号变空格逻辑 ---
+        // --- 🚀 PROMPT 更新：增加强制简中逻辑 ---
         const fullPrompt = `你是一个专业的字幕校对专家。
 任务：利用【参考讲稿】来检测并修复【待修正字幕】。
 
@@ -133,6 +131,7 @@ export default function App() {
 2. **去除语助词**：强制删除“呢、哈、啊、嘛、那个”等无意义口语词。
 3. **保留原话**：在满足上述规则的前提下，尽量保留字幕原本的口语表达。
 4. **修正错别字**：仅修正同音错字（如“起托”->“解脱”）。
+5. **强制简体中文**：无论输入字幕或讲稿是繁体或英文，输出结果必须严格转换为**简体中文**。
 
 【判定示例 (Few-Shot)】：
 - 情况A (逗号变空格)：
@@ -147,10 +146,10 @@ export default function App() {
   讲稿: "你吃饭了吗？"
   字幕: "你吃饭了吗"
   -> 修正: 你吃饭了吗？
-- 情况D (保留原话 & 标点处理)：
-  讲稿: "如果从佛法角度看，这是对的。"
-  字幕: "如果站在佛法来看，这是对的。"
-  -> 修正: 如果站在佛法来看 这是对的
+- 情况D (强制简中)：
+  讲稿: "這是正確的。"
+  字幕: "這是正確的"
+  -> 修正: 这是正确的
 
 【输出要求】：
 1. 必须输出 ${currentBatch.length} 行。
